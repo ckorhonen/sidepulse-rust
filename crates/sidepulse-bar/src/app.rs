@@ -238,17 +238,15 @@ impl App {
         }
         let policy = lid::ClosedLidPolicy::parse(self.settings.closed_lid_policy().as_str())
             .unwrap_or(lid::ClosedLidPolicy::Never);
-        if self
+        // `update` reports whether the hold is active, not whether it changed: log transitions only.
+        let was_active = self.closed_lid.active();
+        let active = self
             .closed_lid
-            .update(policy, self.keep_awake.holding_requested)
-        {
+            .update(policy, self.keep_awake.holding_requested);
+        if active != was_active {
             crate::log(&format!(
                 "closed-lid awake: {}",
-                if self.closed_lid.active() {
-                    "holding"
-                } else {
-                    "released"
-                }
+                if active { "holding" } else { "released" }
             ));
         }
 
