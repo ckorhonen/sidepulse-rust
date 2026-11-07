@@ -10,3 +10,8 @@ pub mod models;
 pub mod origin;
 pub mod providers;
 pub mod pyjson;
+pub mod battery;
+pub mod devices;
+pub mod lid;
+pub mod monitor;
+pub mod power;

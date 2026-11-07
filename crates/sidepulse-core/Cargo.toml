@@ -1,0 +1,20 @@
+[package]
+name = "sidepulse-core"
+description = "Shared SidePulse logic: event parsing, agent status rules, state, logs and IPC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+libc.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

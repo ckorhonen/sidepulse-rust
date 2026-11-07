@@ -371,8 +371,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "sidepulse"
-version = "0.1.0"
+name = "sidepulse-bar"
+version = "0.2.0"
+dependencies = [
+ "sidepulse-core",
+]
+
+[[package]]
+name = "sidepulse-core"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "libc",
@@ -381,6 +388,13 @@ dependencies = [
  "shlex 1.3.0",
  "socket2",
  "tempfile",
+]
+
+[[package]]
+name = "sidepulse-hook"
+version = "0.2.0"
+dependencies = [
+ "sidepulse-core",
 ]
 
 [[package]]

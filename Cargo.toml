@@ -1,32 +1,22 @@
-[package]
-name = "sidepulse"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = ["crates/sidepulse-core", "crates/sidepulse-hook", "crates/sidepulse-bar"]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Unofficial native (Rust) port of SidePulse agent-status components, starting with the agent hook."
 license = "MIT"
 repository = "https://github.com/ckorhonen/sidepulse-rust"
-readme = "README.md"
-keywords = ["sidepulse", "claude-code", "codex", "hooks", "macos"]
 publish = false
 
-[lib]
-name = "sidepulse"
-path = "src/lib.rs"
-
-[[bin]]
-name = "sidepulse-hook"
-path = "src/bin/sidepulse-hook.rs"
-
-[dependencies]
+[workspace.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libc = "0.2"
 regex = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 shlex = "1"
 socket2 = { version = "0.5", features = ["all"] }
-
-[dev-dependencies]
 tempfile = "3"
 
 [profile.release]
