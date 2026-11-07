@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Build release
+        run: cargo build --release
+      - name: Smoke test
+        run: |
+          state="$RUNNER_TEMP/sp-state"
+          log="$state/sidepulse/agent-monitor/claude.jsonl"
+          echo '{"hook_event_name":"Stop","session_id":"ci-demo","last_assistant_message":"Want me to ship it?"}' \
+            | XDG_STATE_HOME="$state" target/release/sidepulse-hook --provider claude --log "$log"
+          grep -q '"session_id":"ci-demo"' "$log"
+          grep -q '"status":"waiting_for_input"' "$state/sidepulse/agent-monitor/event-status.jsonl"
+          # Invalid input and missing arguments must still exit 0 silently.
+          out=$(echo 'not json' | XDG_STATE_HOME="$state" target/release/sidepulse-hook --provider claude --log "$log" 2>&1)
+          test -z "$out"
+          target/release/sidepulse-hook
+  msrv:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80
+      - name: Check on minimum supported Rust
+        run: cargo check --all-targets
