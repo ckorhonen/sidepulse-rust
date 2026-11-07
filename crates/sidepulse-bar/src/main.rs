@@ -65,7 +65,7 @@ fn main() {
 
     // Release power assertions and flush state on SIGTERM/SIGINT (launchd bootout, Ctrl-C).
     for sig in [libc::SIGTERM, libc::SIGINT] {
-        unsafe { libc::signal(sig, on_signal as libc::sighandler_t) };
+        unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
     }
     repeat(1.0, |a| {
         if STOP.load(Ordering::Relaxed) {
