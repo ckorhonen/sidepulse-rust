@@ -390,7 +390,8 @@ impl LedController {
         self.sync_with(mode, brightness, now, write_program_to)
     }
 
-    fn sync_with(
+    /// [`LedController::sync`] with an injected writer (tests, dry runs).
+    pub fn sync_with(
         &mut self,
         mode: AgentMode,
         brightness: u8,

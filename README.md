@@ -45,6 +45,18 @@ and `events.sock`.
 | CPU at idle | 3–21% | **~0%** |
 | Child processes | `ioreg` every second, plus `caffeinate` and `touch` | none (only `sudo -n pmset` for the optional closed-lid helper) |
 
+Removing the polling timers (see "Event-driven, no polling" below) cut idle wakeups by 75–90%. These
+are release builds on an M3 Max under unrelated load, idle for 120 s, with temporary state. The
+wakeups are interrupt wakeups from `proc_pid_rusage`, because `top`'s IDLEW column reads 0 on a busy
+machine.
+
+| Idle, 120 s window | Polling (phase 2) | Event-driven |
+|---|---|---|
+| Wakeups, `SIDEPULSE_VOLUMES` (5 s fallback rescan) | 1.08/s | **0.27/s** |
+| Wakeups, real `/Volumes` with `SIDEPULSE_DRY_RUN=1` | not measured (would write to the device) | **0.13/s** (2 of them are keepalive touches) |
+| CPU per minute | 21 ms | **2.5 ms** (real `/Volumes`), 5.7 ms (`SIDEPULSE_VOLUMES`) |
+| Memory footprint | 13 MB | **13–14 MB** (24 MB in both after replaying 412 real hook records) |
+
 What makes the difference:
 
 - **Bounded state.** `latest.json` keeps statuses from the last 6 hours, at most 256. It's written as
@@ -55,8 +67,17 @@ What makes the difference:
   day for the lid alone).
 - **Native power control.** Keep-awake uses IOPM assertions instead of a `caffeinate` child, and
   keepalive touches use `utimes` instead of `/usr/bin/touch`.
-- **Event-driven.** The socket thread blocks in `accept`; Python woke every 0.5 s. The menu is rebuilt
-  only when its contents change.
+- **Event-driven, no polling.** The socket thread blocks in `accept`; Python woke every 0.5 s. Every
+  other input is a notification on the main run loop: the lid via `IOPMrootDomain` interest
+  messages (`kIOPMMessageClamshellStateChange`), plug, unplug and charge changes via
+  `IOPSNotificationCreateRunLoopSource`, volumes via `NSWorkspace` mount, unmount and rename
+  notifications, and SIGTERM/SIGINT via dispatch signal sources. Time-based changes (a finished
+  session hiding after 90 s, a post-tool status turning done at 120 s, staleness after an hour, the
+  end of the 5-minute keep-awake grace) are computed ahead and armed as a single one-shot timer.
+  `latest.json` is written once, 2 s after the first change of a burst, and on shutdown. The menu is
+  refilled when it opens (so session ages are current) and otherwise only when its contents change.
+- **Exact LED worker sleeps.** The LED thread sleeps until the next keepalive touch is due (60 s
+  after each volume's last one) or the next charging-pulse rewrite, instead of waking every 20 s.
 - **No blocking writes.** A single LED worker thread owns every SD-card write, so a sleeping card
   never stalls the menu bar. The newest request always wins (Python dropped a sync that arrived while
   one was in flight), and the charging pulse is rewritten at its intended wattage-based cadence
@@ -82,7 +103,12 @@ XDG_STATE_HOME=/tmp/sp/state XDG_CONFIG_HOME=/tmp/sp/config SIDEPULSE_VOLUMES=/t
 ```
 
 `SIDEPULSE_VOLUMES` replaces `/Volumes` as the place to look for devices. Create
-`/tmp/sp/vol/SidePulsePro/LEDS.LED` to get a fake 8-LED device.
+`/tmp/sp/vol/SidePulsePro/LEDS.LED` to get a fake 8-LED device. Fake mounts post no notifications,
+so with `SIDEPULSE_VOLUMES` set the app rescans that folder every 5 s instead.
+
+`SIDEPULSE_DRY_RUN=1` makes the LED worker log each write and keepalive touch instead of doing it.
+Use it to run against the real `/Volumes` (and its mount notifications) without writing to a device
+another SidePulse app owns.
 
 Not ported yet: the Setup and Settings windows (hook install, transcript toggles, debug export,
 animation editor), the notch Screen Bar, composited app icons in session rows, and the brightness

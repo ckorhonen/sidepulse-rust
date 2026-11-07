@@ -351,3 +351,175 @@ pub fn assertion_release(id: IOPMAssertionID) -> IoReturn {
     // SAFETY: releasing an assertion ID is safe even if it is stale; the kernel validates it.
     unsafe { IOPMAssertionRelease(id) }
 }
+
+// ---- Notifications delivered on the main run loop -------------------------------------------
+
+pub type CFRunLoopRef = *mut c_void;
+pub type CFRunLoopSourceRef = *mut c_void;
+pub type CFRunLoopMode = CFStringRef;
+pub type IONotificationPortRef = *mut c_void;
+type IOServiceInterestCallback = extern "C" fn(
+    refcon: *mut c_void,
+    service: IoObjectT,
+    message_type: u32,
+    argument: *mut c_void,
+);
+type IOPowerSourceCallbackType = extern "C" fn(context: *mut c_void);
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFRunLoopCommonModes: CFRunLoopMode;
+    fn CFRunLoopGetMain() -> CFRunLoopRef;
+    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFRunLoopMode);
+    fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFRunLoopMode);
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IONotificationPortCreate(main_port: MachPort) -> IONotificationPortRef;
+    fn IONotificationPortDestroy(notify: IONotificationPortRef);
+    fn IONotificationPortGetRunLoopSource(notify: IONotificationPortRef) -> CFRunLoopSourceRef;
+    fn IOServiceAddInterestNotification(
+        notify: IONotificationPortRef,
+        service: IoObjectT,
+        interest_type: *const c_char,
+        callback: IOServiceInterestCallback,
+        refcon: *mut c_void,
+        notification: *mut IoObjectT,
+    ) -> KernReturn;
+    fn IOPSNotificationCreateRunLoopSource(
+        callback: IOPowerSourceCallbackType,
+        context: *mut c_void,
+    ) -> CFRunLoopSourceRef;
+}
+
+/// `kIOGeneralInterest`.
+const kIOGeneralInterest: &[u8] = b"IOGeneralInterest\0";
+
+type InterestHandler = Box<dyn FnMut(u32)>;
+
+/// A `kIOGeneralInterest` registration on one service, delivered on the main run loop (common
+/// modes, so it also fires while a menu is open). Unregistered on drop.
+pub struct InterestWatch {
+    port: IONotificationPortRef,
+    notification: IoObjectT,
+    // Boxed twice so the refcon stays a thin pointer at a stable address.
+    _handler: Box<InterestHandler>,
+}
+
+extern "C" fn interest_trampoline(
+    refcon: *mut c_void,
+    _service: IoObjectT,
+    message_type: u32,
+    _argument: *mut c_void,
+) {
+    // SAFETY: `refcon` is the `Box<InterestHandler>` owned by the `InterestWatch`, which outlives
+    // the registration (it is released in `Drop` before the box is freed). IOKit calls this on the
+    // main run loop only, so there is never concurrent access to the handler.
+    let handler = unsafe { &mut *refcon.cast::<InterestHandler>() };
+    handler(message_type);
+}
+
+impl InterestWatch {
+    /// Registers `handler(message_type)` for general-interest messages from the first service
+    /// matching `class_name`. Must be called on the main thread.
+    pub fn new(class_name: &str, handler: InterestHandler) -> Option<Self> {
+        let service = IoObject::matching_service(class_name)?;
+        let mut handler = Box::new(handler);
+        // SAFETY: `kIOMainPortDefault` is valid; the returned port (or null) is checked.
+        let port = unsafe { IONotificationPortCreate(kIOMainPortDefault) };
+        if port.is_null() {
+            return None;
+        }
+        let mut notification: IoObjectT = 0;
+        let refcon = (&mut *handler as *mut InterestHandler).cast::<c_void>();
+        // SAFETY: `port` and `service.0` are live, the interest type is NUL-terminated, the
+        // callback has the C signature IOKit expects, `refcon` points at the boxed handler that
+        // this watch keeps alive, and `notification` is a valid out-pointer. The service object
+        // may be released after registering; the notification holds its own reference.
+        let kr = unsafe {
+            IOServiceAddInterestNotification(
+                port,
+                service.0,
+                kIOGeneralInterest.as_ptr().cast(),
+                interest_trampoline,
+                refcon,
+                &mut notification,
+            )
+        };
+        if kr != 0 {
+            // SAFETY: `port` came from `IONotificationPortCreate` and is not used afterwards.
+            unsafe { IONotificationPortDestroy(port) };
+            return None;
+        }
+        // SAFETY: `port` is live; its run-loop source is owned by the port (not retained here)
+        // and is added to the main run loop, which lives for the whole process.
+        unsafe {
+            let source = IONotificationPortGetRunLoopSource(port);
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+        }
+        Some(Self {
+            port,
+            notification,
+            _handler: handler,
+        })
+    }
+}
+
+impl Drop for InterestWatch {
+    fn drop(&mut self) {
+        // SAFETY: both handles are owned by this watch. Releasing the notification object stops
+        // delivery; destroying the port also invalidates its run-loop source.
+        unsafe {
+            IOObjectRelease(self.notification);
+            IONotificationPortDestroy(self.port);
+        }
+    }
+}
+
+type PowerSourceHandler = Box<dyn FnMut()>;
+
+/// `IOPSNotificationCreateRunLoopSource`: fires on any power-source change (plug, unplug,
+/// charge level, time remaining), on the main run loop. Removed on drop.
+pub struct PowerSourceWatch {
+    source: CFRunLoopSourceRef,
+    _handler: Box<PowerSourceHandler>,
+}
+
+extern "C" fn power_source_trampoline(context: *mut c_void) {
+    // SAFETY: `context` is the `Box<PowerSourceHandler>` owned by the `PowerSourceWatch`, which
+    // removes the source before freeing it; delivery is on the main run loop only.
+    let handler = unsafe { &mut *context.cast::<PowerSourceHandler>() };
+    handler();
+}
+
+impl PowerSourceWatch {
+    /// Must be called on the main thread.
+    pub fn new(handler: PowerSourceHandler) -> Option<Self> {
+        let mut handler = Box::new(handler);
+        let context = (&mut *handler as *mut PowerSourceHandler).cast::<c_void>();
+        // SAFETY: the callback has the expected C signature and `context` points at the boxed
+        // handler kept alive by this watch. The result is a +1 source (or null).
+        let source =
+            unsafe { IOPSNotificationCreateRunLoopSource(power_source_trampoline, context) };
+        if source.is_null() {
+            return None;
+        }
+        // SAFETY: `source` is a live run-loop source; the main run loop lives for the process.
+        unsafe { CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes) };
+        Some(Self {
+            source,
+            _handler: handler,
+        })
+    }
+}
+
+impl Drop for PowerSourceWatch {
+    fn drop(&mut self) {
+        // SAFETY: `source` is the +1 reference created in `new`, added to the main run loop.
+        unsafe {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), self.source, kCFRunLoopCommonModes);
+            CFRelease(self.source);
+        }
+    }
+}

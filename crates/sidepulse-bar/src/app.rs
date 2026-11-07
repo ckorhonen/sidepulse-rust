@@ -5,8 +5,11 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use block2::RcBlock;
 use chrono::Utc;
+use objc2::rc::Retained;
 use objc2::MainThreadMarker;
+use objc2_foundation::NSTimer;
 use serde_json::Value;
 
 use sidepulse_core::battery::{self, BatterySnapshot, PowerChangePreview};
@@ -60,7 +63,22 @@ pub struct App {
     device_signature: Vec<(PathBuf, u64, u64)>,
     lid_closed: Option<bool>,
     refresh_pending: bool,
+    flush_pending: bool,
+    /// One-shot timer for the next time-based refresh (see [`App::schedule_next_refresh`]).
+    refresh_timer: Option<Retained<NSTimer>>,
+    keep_awake_detail: String,
 }
+
+/// Slack added after a predicted transition, because the monitor's thresholds are strict.
+const TRANSITION_MARGIN: f64 = 0.25;
+/// Timer tolerance for a predicted transition: the menu may change up to a second late.
+const TRANSITION_TOLERANCE: f64 = 1.0;
+/// Safety refresh when nothing is predicted (battery details IOKit may not notify about, and
+/// any clock change). Coarse, with a large tolerance so the system can batch it.
+const SAFETY_REFRESH: f64 = 300.0;
+const SAFETY_TOLERANCE: f64 = 60.0;
+/// `latest.json` is written at most this long after the first change of a burst.
+const FLUSH_DELAY: f64 = 2.0;
 
 /// Devices under `$SIDEPULSE_VOLUMES` when set (used for side-by-side testing), else `/Volumes`.
 fn discover_devices() -> Vec<Device> {
@@ -99,7 +117,7 @@ impl App {
             monitor,
             settings: Settings::load_default(),
             ui: StatusUi::new(mtm, handler),
-            leds: LedWorker::start(),
+            leds: LedWorker::start(crate::led::dry_run_from_env()),
             keep_awake: KeepAwake::default(),
             closed_lid: ClosedLidAwake::default(),
             preview: PowerChangePreview::default(),
@@ -108,6 +126,9 @@ impl App {
             devices,
             lid_closed: None,
             refresh_pending: false,
+            flush_pending: false,
+            refresh_timer: None,
+            keep_awake_detail: String::new(),
         }
     }
 
@@ -118,6 +139,66 @@ impl App {
             self.refresh_pending = true;
             dispatch2::DispatchQueue::main().exec_async(|| with_app(|app| app.refresh()));
         }
+        self.schedule_flush();
+    }
+
+    /// Debounced `latest.json` write: one flush [`FLUSH_DELAY`] after state first became dirty,
+    /// replacing the 2 s flush timer. Shutdown flushes anything still pending.
+    pub fn schedule_flush(&mut self) {
+        if self.flush_pending || !self.monitor.is_dirty() {
+            return;
+        }
+        self.flush_pending = true;
+        dispatch2::DispatchQueue::main()
+            .after(dispatch_time(FLUSH_DELAY), || {
+                with_app(|app| {
+                    app.flush_pending = false;
+                    app.flush_state();
+                    // Still dirty only if the write failed: retry like the old 2 s timer did.
+                    app.schedule_flush();
+                })
+            })
+            .ok();
+    }
+
+    /// Arms a single one-shot timer for the next time-based change instead of refreshing every
+    /// 15 s: the next agent status transition (completed hiding, post-tool working turning
+    /// completed, staleness), the end of the keep-awake grace period, or else a coarse safety
+    /// refresh. Events, power-source and device notifications refresh on their own.
+    fn schedule_next_refresh(&mut self, now: Instant) {
+        let mut wait = SAFETY_REFRESH;
+        let mut tolerance = SAFETY_TOLERANCE;
+        let utc_now = Utc::now();
+        let transition = self
+            .monitor
+            .next_transition_at(utc_now)
+            .map(|at| (at - utc_now).num_milliseconds() as f64 / 1000.0);
+        let grace = self
+            .keep_awake
+            .grace_deadline(now)
+            .map(|at| (at - now).as_secs_f64());
+        for secs in transition.into_iter().chain(grace) {
+            let secs = secs.max(0.0) + TRANSITION_MARGIN;
+            if secs < wait {
+                wait = secs;
+                tolerance = TRANSITION_TOLERANCE;
+            }
+        }
+        if let Some(old) = self.refresh_timer.take() {
+            old.invalidate();
+        }
+        let block = RcBlock::new(|_timer: std::ptr::NonNull<NSTimer>| {
+            with_app(|app| {
+                app.refresh_timer = None;
+                app.refresh();
+            })
+        });
+        // SAFETY: called on the main thread (the app lives there); the block is copied by the
+        // timer, and a non-repeating timer is scheduled on the current (main) run loop.
+        let timer =
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(wait, false, &block) };
+        timer.setTolerance(tolerance);
+        self.refresh_timer = Some(timer);
     }
 
     /// `refresh_`: snapshot, status item, LEDs, keep-awake, menu.
@@ -146,8 +227,14 @@ impl App {
         }
         self.sync_leds(mode, battery.as_ref(), now);
 
-        if self.keep_awake.update(mode, now) {
-            crate::log(&format!("keep awake: {}", self.keep_awake.detail(now)));
+        self.keep_awake.update(mode, now);
+        // Log transitions only (refreshes are now per event, so logging every held refresh
+        // would repeat the same line). The grace countdown is not a transition.
+        let detail = self.keep_awake.detail(now);
+        let kind = detail.split(':').next().unwrap_or_default().to_string();
+        if kind != self.keep_awake_detail {
+            crate::log(&format!("keep awake: {detail}"));
+            self.keep_awake_detail = kind;
         }
         let policy = lid::ClosedLidPolicy::parse(self.settings.closed_lid_policy().as_str())
             .unwrap_or(lid::ClosedLidPolicy::Never);
@@ -168,6 +255,7 @@ impl App {
         let model = self.menu_model(&snapshot);
         self.ui.set_menu(&model);
         self.snapshot = Some(snapshot);
+        self.schedule_next_refresh(now);
     }
 
     fn sync_leds(&mut self, mode: AgentMode, battery: Option<&BatterySnapshot>, now: Instant) {
@@ -247,8 +335,9 @@ impl App {
         }
     }
 
-    /// 2 s device poll (`poll_devices_once`): refresh only when the set of volumes changed.
-    pub fn poll_devices(&mut self) {
+    /// `poll_devices_once`, run on volume mount/unmount/rename notifications instead of every
+    /// 2 s: refresh only when the set of volumes changed.
+    pub fn rescan_devices(&mut self) {
         let devices = discover_devices();
         let signature = device_signature(&devices);
         if signature != self.device_signature {
@@ -259,7 +348,8 @@ impl App {
         }
     }
 
-    /// 1 s lid poll (`pollLid:`): the first reading is a baseline; changes play an animation.
+    /// `pollLid:`, run once at startup and then on each clamshell notification instead of every
+    /// second: the first reading is a baseline; changes play an animation.
     pub fn poll_lid(&mut self) {
         let Some(closed) = lid::clamshell_closed() else {
             return;
@@ -332,6 +422,11 @@ impl App {
                 ui::terminate(self.mtm);
                 return;
             }
+            Action::MenuOpening => {
+                // Session ages in tooltips are only refreshed when someone looks at them.
+                self.refresh();
+                return;
+            }
         }
         self.save_settings();
         self.refresh();
@@ -384,6 +479,6 @@ fn open_terminal_command(command: &str) {
         .spawn();
 }
 
-fn dispatch_time(seconds: f64) -> dispatch2::DispatchTime {
+pub fn dispatch_time(seconds: f64) -> dispatch2::DispatchTime {
     dispatch2::DispatchTime::NOW.time((seconds * 1e9) as i64)
 }
