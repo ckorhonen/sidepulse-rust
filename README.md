@@ -65,11 +65,14 @@ What makes the difference:
 Install it as the login agent in place of the Python app:
 
 ```sh
-cargo build --release
-install -m 755 target/release/sidepulse-bar ~/.local/bin/sidepulse-bar
-launchctl bootout gui/$(id -u)/io.sidepulse.agentstatus   # stop the Python app
-# then load a LaunchAgent that runs ~/.local/bin/sidepulse-bar (see AGENTS.md for the plist used)
+scripts/install-bar.sh            # builds, installs ~/.local/bin/sidepulse-bar, swaps the LaunchAgent
+scripts/install-bar.sh --revert   # back to the Python app
 ```
+
+The script stops the Python app (`io.sidepulse.agentstatus`), because both apps own the same socket
+and device. It backs up that app's plist and loads `io.sidepulse.bar`, which restarts after a crash
+but stays stopped after Quit. Logs go to
+`~/.local/state/sidepulse/agent-monitor/sidepulse-bar.out.log`.
 
 For a side-by-side test that doesn't touch your real device or state:
 
