@@ -2,7 +2,7 @@
 name = "sidepulse"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "Unofficial native (Rust) port of SidePulse agent-status components, starting with the agent hook."
 license = "MIT"
 repository = "https://github.com/ckorhonen/sidepulse-rust"

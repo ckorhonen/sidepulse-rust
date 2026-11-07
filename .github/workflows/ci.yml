@@ -41,6 +41,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.80
+      - uses: dtolnay/rust-toolchain@1.85
       - name: Check on minimum supported Rust
         run: cargo check --all-targets

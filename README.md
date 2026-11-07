@@ -36,7 +36,7 @@ Measured on an M3 Max under heavy unrelated load. Expect lower absolute numbers 
 
 - macOS. Process ancestry uses `proc_pidinfo` and `sysctl(KERN_PROCARGS2)`. On other systems the
   crate builds, but origin detection falls back to environment variables.
-- Rust 1.80 or newer.
+- Rust 1.85 or newer.
 - For the hook to update the menu bar, a running SidePulse app (the Python one for now) listening on
   `~/.local/state/sidepulse/agent-monitor/events.sock`. Without it, the hook still writes its logs.
 
