@@ -31,6 +31,21 @@ impl AgentMode {
         }
     }
 
+    /// `AgentMode(value)`: the inverse of [`AgentMode::value`].
+    pub fn from_value(value: &str) -> Option<Self> {
+        Some(match value {
+            "idle_ready" => Self::IdleReady,
+            "working" => Self::Working,
+            "tool_running" => Self::ToolRunning,
+            "waiting_for_input" => Self::WaitingForInput,
+            "long_task_progress" => Self::LongTaskProgress,
+            "blocked_error" => Self::BlockedError,
+            "completed" => Self::Completed,
+            "unknown" => Self::Unknown,
+            _ => return None,
+        })
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::IdleReady => "Idle / Ready",

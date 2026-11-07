@@ -1,0 +1,12 @@
+[package]
+name = "sidepulse-hook"
+description = "Drop-in native replacement for SidePulse's Python agent hook."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sidepulse-core = { path = "../sidepulse-core" }
