@@ -95,6 +95,19 @@ and device. It backs up that app's plist and loads `io.sidepulse.bar`, which res
 but stays stopped after Quit. Logs go to
 `~/.local/state/sidepulse/agent-monitor/sidepulse-bar.out.log`.
 
+To switch a Mac that runs the stock Python SidePulse, including one with no Rust toolchain, copy
+the two release binaries over and run:
+
+```sh
+install -m 755 sidepulse-hook ~/.local/bin/sidepulse-hook
+python3 scripts/switch-hooks.py   # use the Python that has SidePulse installed
+SIDEPULSE_BAR_BIN=./sidepulse-bar scripts/install-bar.sh
+```
+
+`switch-hooks.py` points the Claude, Codex and Grok hook commands at the native binary and backs up
+each file first. For Codex it also re-trusts the changed hooks the way `sidepulse setup` does, using
+`codex app-server`'s `hooks/list`, so Codex doesn't ask you to review them again.
+
 For a side-by-side test that doesn't touch your real device or state:
 
 ```sh

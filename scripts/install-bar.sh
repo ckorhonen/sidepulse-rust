@@ -2,6 +2,7 @@
 # Install sidepulse-bar as the login agent, replacing the Python SidePulse menu-bar app.
 #   scripts/install-bar.sh            install (builds release first) and switch over
 #   scripts/install-bar.sh --revert   stop sidepulse-bar and restore the Python app's agent
+#   SIDEPULSE_BAR_BIN=/path/to/sidepulse-bar scripts/install-bar.sh   install a prebuilt binary (no cargo)
 set -euo pipefail
 
 LABEL=io.sidepulse.bar
@@ -44,10 +45,14 @@ if [[ "${1:-}" == "--revert" ]]; then
   exit 0
 fi
 
-cd "$(dirname "$0")/.."
-cargo build --release -p sidepulse-bar
+SRC="${SIDEPULSE_BAR_BIN:-}"
+if [[ -z "$SRC" ]]; then
+  cd "$(dirname "$0")/.."
+  cargo build --release -p sidepulse-bar
+  SRC=target/release/sidepulse-bar
+fi
 mkdir -p "$(dirname "$BIN")" "$STATE" "$AGENTS"
-install -m 755 target/release/sidepulse-bar "$BIN"
+install -m 755 "$SRC" "$BIN"
 
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
