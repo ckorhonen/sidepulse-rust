@@ -4,10 +4,15 @@
 //!
 //! Also handles what Python did on the 15 s refresh: keepalive touches (≤ once per 60 s per
 //! volume) and the charging-pulse rewrite, which now follows the intended wattage-based cadence
-//! (`max(0.9, 3.0 − 2.1·ratio)` s) instead of being capped by the refresh interval.
+//! (`max(0.9, 3.0 − 2.1·ratio)` s) instead of being capped by the refresh interval. The thread
+//! sleeps exactly until the next of those is due (or a new request arrives), never on a fixed tick.
+//!
+//! With `SIDEPULSE_DRY_RUN=1` the worker logs each write and touch instead of doing it, so the app
+//! can run against the real `/Volumes` without touching a device another app owns.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -52,16 +57,63 @@ struct DeviceState {
     showing_battery: Option<bool>,
 }
 
+type WriteFn = fn(&Path, &str) -> io::Result<()>;
+type TouchFn = fn(&Path) -> io::Result<()>;
+
+/// How the worker reaches the card: real writes, or log-only for `SIDEPULSE_DRY_RUN`.
+#[derive(Clone, Copy)]
+struct Io {
+    write: WriteFn,
+    touch: TouchFn,
+}
+
+impl Io {
+    fn new(dry_run: bool) -> Self {
+        if dry_run {
+            Self {
+                write: dry_write,
+                touch: dry_touch,
+            }
+        } else {
+            Self {
+                write: write_program_to,
+                touch,
+            }
+        }
+    }
+}
+
+fn dry_write(target: &Path, text: &str) -> io::Result<()> {
+    let preview: String = text.chars().take(80).collect();
+    crate::log(&format!(
+        "dry run: would write {} bytes to {}: {preview:?}",
+        text.len(),
+        target.display()
+    ));
+    Ok(())
+}
+
+fn dry_touch(path: &Path) -> io::Result<()> {
+    crate::log(&format!("dry run: would touch {}", path.display()));
+    Ok(())
+}
+
+/// `SIDEPULSE_DRY_RUN` set to anything but empty or `0`.
+pub fn dry_run_from_env() -> bool {
+    std::env::var("SIDEPULSE_DRY_RUN").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 pub struct LedWorker {
     tx: Sender<Message>,
 }
 
 impl LedWorker {
-    pub fn start() -> Self {
+    pub fn start(dry_run: bool) -> Self {
         let (tx, rx) = mpsc::channel();
+        let io = Io::new(dry_run);
         std::thread::Builder::new()
             .name("sidepulse-leds".into())
-            .spawn(move || run(rx))
+            .spawn(move || run(rx, io))
             .expect("spawn LED worker");
         Self { tx }
     }
@@ -71,22 +123,22 @@ impl LedWorker {
     }
 }
 
-const KEEPALIVE_CHECK: Duration = Duration::from_secs(20);
-
-fn run(rx: Receiver<Message>) {
+fn run(rx: Receiver<Message>, io: Io) {
     let mut states: HashMap<PathBuf, DeviceState> = HashMap::new();
-    let mut toucher = KeepaliveToucher::new(touch, false);
+    let mut toucher = KeepaliveToucher::new(io.touch, false);
     let mut latest: Option<LedRequest> = None;
     loop {
-        let wait = latest
-            .as_ref()
-            .and_then(next_battery_rewrite)
-            .unwrap_or(KEEPALIVE_CHECK)
-            .min(KEEPALIVE_CHECK);
-        let message = match rx.recv_timeout(wait) {
-            Ok(m) => Some(m),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => return,
+        let message = match next_wake(latest.as_ref(), &toucher, Instant::now()) {
+            // Nothing scheduled: block until the next request.
+            None => match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => return,
+            },
+            Some(wait) => match rx.recv_timeout(wait) {
+                Ok(m) => Some(m),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
         };
         // Coalesce a burst: keep the newest sync, but never skip an animation.
         let mut pending = message.into_iter().collect::<Vec<_>>();
@@ -96,7 +148,7 @@ fn run(rx: Receiver<Message>) {
                 Message::Sync(request) => latest = Some(*request),
                 Message::Animate { program, duration } => {
                     if let Some(request) = &latest {
-                        animate(request, &program);
+                        animate(request, &program, io.write);
                     }
                     std::thread::sleep(duration + Duration::from_millis(150));
                     // `restore_led_display`: force a full rewrite after the animation.
@@ -105,15 +157,37 @@ fn run(rx: Receiver<Message>) {
             }
         }
         if let Some(request) = &latest {
-            apply(request, &mut states, &mut toucher);
+            apply(request, &mut states, &mut toucher, io.write);
         }
     }
 }
 
-fn animate(request: &LedRequest, program: &str) {
+/// How long to sleep before the next keepalive touch or charging-pulse rewrite is due, or `None`
+/// to wait for the next request. Keepalive is due exactly 60 s after each volume's last touch.
+fn next_wake(
+    request: Option<&LedRequest>,
+    toucher: &KeepaliveToucher,
+    now: Instant,
+) -> Option<Duration> {
+    let request = request?;
+    let keepalive = toucher
+        .next_due(&request_keepalive_targets(request), now)
+        .map(|due| due.saturating_duration_since(now));
+    match (keepalive, next_battery_rewrite(request)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn request_keepalive_targets(request: &LedRequest) -> Vec<PathBuf> {
+    let devices: Vec<Device> = request.devices.iter().map(|c| c.device.clone()).collect();
+    keepalive_targets(&devices)
+}
+
+fn animate(request: &LedRequest, program: &str, write: WriteFn) {
     for cfg in &request.devices {
         if let Ok(text) = lid_animation_program(program, cfg.brightness) {
-            let _ = write_program_to(&cfg.device.target(), &text);
+            let _ = write(&cfg.device.target(), &text);
         }
     }
 }
@@ -141,6 +215,7 @@ fn apply(
     request: &LedRequest,
     states: &mut HashMap<PathBuf, DeviceState>,
     toucher: &mut KeepaliveToucher,
+    write: WriteFn,
 ) {
     let now = Instant::now();
     states.retain(|root, _| request.devices.iter().any(|c| &c.device.root == root));
@@ -157,11 +232,11 @@ fn apply(
             (Some(snapshot), true) => state
                 .battery
                 .get_or_insert_with(|| BatteryLedController::new(cfg.device.clone()))
-                .sync(snapshot, cfg.brightness, now),
+                .sync_with(snapshot, cfg.brightness, now, write),
             _ => state
                 .agent
                 .get_or_insert_with(|| LedController::new(cfg.device.clone()))
-                .sync(request.mode, cfg.brightness, now),
+                .sync_with(request.mode, cfg.brightness, now, write),
         };
         match result {
             Ok(Some(_)) => crate::log(&format!("LEDs updated on {}", cfg.device.root.display())),
@@ -172,8 +247,61 @@ fn apply(
             )),
         }
     }
-    let devices: Vec<Device> = request.devices.iter().map(|c| c.device.clone()).collect();
-    for target in keepalive_targets(&devices) {
+    for target in request_keepalive_targets(request) {
         toucher.poke(&target, now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_touch(_: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn request(root: &Path) -> LedRequest {
+        LedRequest {
+            devices: vec![DeviceConfig {
+                device: test_device(root),
+                display: LedDisplay::Agent,
+                brightness: 255,
+            }],
+            mode: AgentMode::IdleReady,
+            battery: None,
+            battery_preview: false,
+            full_charge_ratio: 0.0,
+        }
+    }
+
+    fn test_device(root: &Path) -> Device {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = dir.path().join("SidePulsePro");
+        std::fs::create_dir(&dev).unwrap();
+        std::fs::write(dev.join("LEDS.LED"), b"").unwrap();
+        let mut d = sidepulse_core::devices::discover_in(dir.path())
+            .into_iter()
+            .next()
+            .expect("fake device");
+        d.root = root.to_path_buf();
+        d
+    }
+
+    #[test]
+    fn sleeps_until_the_keepalive_is_due_and_blocks_without_requests() {
+        let t0 = Instant::now();
+        let mut toucher = KeepaliveToucher::new(ok_touch, false);
+        assert_eq!(next_wake(None, &toucher, t0), None);
+        let req = request(Path::new("/tmp/fake/SidePulsePro"));
+        // Never touched: due now.
+        assert_eq!(next_wake(Some(&req), &toucher, t0), Some(Duration::ZERO));
+        for target in request_keepalive_targets(&req) {
+            toucher.poke(&target, t0);
+        }
+        let later = t0 + Duration::from_secs(25);
+        assert_eq!(
+            next_wake(Some(&req), &toucher, later),
+            Some(Duration::from_secs(35))
+        );
     }
 }

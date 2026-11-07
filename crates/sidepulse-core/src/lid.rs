@@ -73,6 +73,42 @@ pub fn clamshell_closed() -> Option<bool> {
     None
 }
 
+/// `kIOPMMessageClamshellStateChange` = `iokit_family_msg(sub_iokit_powermanagement, 0x100)`:
+/// `sys_iokit` (0x38 << 26) | `err_sub(13)` (13 << 14) | 0x100 = `0xE0034100`. `IOPMrootDomain`
+/// sends it as a general-interest message when `AppleClamshellState` or
+/// `AppleClamshellCausesSleep` changes.
+pub const CLAMSHELL_STATE_CHANGE_MESSAGE: u32 = (0x38 << 26) | (13 << 14) | 0x100;
+
+/// A registration for clamshell change notifications on `IOPMrootDomain`, delivered on the main
+/// run loop (replaces the Python app's 1 s `ioreg` poll). Unregistered on drop.
+pub struct ClamshellWatch {
+    #[cfg(target_os = "macos")]
+    _inner: crate::power::iokit::InterestWatch,
+}
+
+impl ClamshellWatch {
+    /// Calls `on_change` on the main thread whenever the clamshell state may have changed (read
+    /// it again with [`clamshell_closed`]). `None` when notifications are unavailable. Must be
+    /// called on the main thread, which must run its run loop.
+    #[cfg(target_os = "macos")]
+    pub fn new(mut on_change: impl FnMut() + 'static) -> Option<Self> {
+        let inner = crate::power::iokit::InterestWatch::new(
+            "IOPMrootDomain",
+            Box::new(move |message| {
+                if message == CLAMSHELL_STATE_CHANGE_MESSAGE {
+                    on_change();
+                }
+            }),
+        )?;
+        Some(Self { _inner: inner })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn new(_on_change: impl FnMut() + 'static) -> Option<Self> {
+        None
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn sleep_disabled() -> Option<bool> {
     None
@@ -363,6 +399,12 @@ fn join_errors(errors: Vec<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamshell_message_matches_the_iopm_header() {
+        // Value of kIOPMMessageClamshellStateChange from <IOKit/pwr_mgt/IOPM.h>.
+        assert_eq!(CLAMSHELL_STATE_CHANGE_MESSAGE, 0xE003_4100);
+    }
 
     #[derive(Default)]
     struct FakeHold {

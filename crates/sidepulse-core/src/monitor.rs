@@ -225,6 +225,16 @@ impl LiveMonitor {
         snapshot_from_statuses(self.statuses.values(), now, self.config.stale_after)
     }
 
+    /// The earliest time after `now` at which [`LiveMonitor::snapshot`] can change without a new
+    /// event: a completed status hiding ([`COMPLETED_VISIBLE_SECONDS`]), an idle one expiring, a
+    /// post-tool `WORKING` turning `COMPLETED` ([`POST_TOOL_WORKING_VISIBLE_SECONDS`]) or any
+    /// other status going stale (`stale_after`). The thresholds are strict (`age > limit`), so a
+    /// snapshot taken exactly at the returned time may still show the old state; callers should
+    /// add a small margin. `None` when no transition is pending.
+    pub fn next_transition_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        next_transition_at(self.statuses.values(), now, self.config.stale_after)
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -452,6 +462,34 @@ pub fn status_for_snapshot(status: &AgentStatus, now: DateTime<Utc>) -> AgentSta
         status.mode = AgentMode::Completed;
     }
     status
+}
+
+/// See [`LiveMonitor::next_transition_at`]. Mirrors the thresholds in [`status_is_stale`] and
+/// [`status_for_snapshot`].
+pub fn next_transition_at<'a>(
+    statuses: impl IntoIterator<Item = &'a AgentStatus>,
+    now: DateTime<Utc>,
+    stale_after: Duration,
+) -> Option<DateTime<Utc>> {
+    let mut next: Option<DateTime<Utc>> = None;
+    for status in statuses {
+        let limits: &[Duration] = match status.mode {
+            AgentMode::Completed => &[Duration::seconds(COMPLETED_VISIBLE_SECONDS)],
+            AgentMode::IdleReady => &[Duration::seconds(IDLE_VISIBLE_SECONDS)],
+            AgentMode::Working if status.event_name == "PostToolUse" => &[
+                Duration::seconds(POST_TOOL_WORKING_VISIBLE_SECONDS),
+                stale_after,
+            ],
+            _ => &[stale_after],
+        };
+        for limit in limits {
+            let at = status.updated_at + *limit;
+            if at > now && next.is_none_or(|n| at < n) {
+                next = Some(at);
+            }
+        }
+    }
+    next
 }
 
 /// `snapshot_from_statuses`.
@@ -727,6 +765,49 @@ mod tests {
         );
         assert!(!m.ingest_at(ev, t));
         assert_eq!(m.snapshot(t).aggregate.mode, AgentMode::Completed);
+    }
+
+    #[test]
+    fn next_transition_is_the_earliest_pending_threshold() {
+        let t = base();
+        let hour = Duration::hours(1);
+        let s = [
+            status("done", AgentMode::Completed, t, "Stop"),
+            status("tool", AgentMode::Working, t, "PostToolUse"),
+            status("work", AgentMode::Working, t, "UserPromptSubmit"),
+            status("idle", AgentMode::IdleReady, t, "SessionStart"),
+        ];
+        let at = |secs| t + Duration::seconds(secs);
+        // Completed hides at +90, post-tool working flips at +120, the rest go stale at +3600.
+        assert_eq!(next_transition_at(&s, t, hour), Some(at(90)));
+        assert_eq!(next_transition_at(&s, at(90), hour), Some(at(120)));
+        assert_eq!(next_transition_at(&s, at(120), hour), Some(at(3600)));
+        assert_eq!(next_transition_at(&s, at(3600), hour), None);
+        assert_eq!(next_transition_at([], t, hour), None);
+    }
+
+    #[test]
+    fn snapshot_changes_just_after_each_predicted_transition() {
+        let t = base();
+        let hour = Duration::hours(1);
+        let ms = Duration::milliseconds;
+        for s in [
+            status("done", AgentMode::Completed, t, "Stop"),
+            status("tool", AgentMode::Working, t, "PostToolUse"),
+            status("work", AgentMode::WaitingForInput, t, "Notification"),
+        ] {
+            let s = [s];
+            let next = next_transition_at(&s, t, hour).unwrap();
+            let view = |at| {
+                let snap = snapshot_from_statuses(&s, at, hour);
+                let modes: Vec<_> = snap.statuses.iter().map(|x| x.mode).collect();
+                (snap.aggregate.mode, modes, snap.stale.len())
+            };
+            let start = view(t);
+            assert_eq!(view(next - ms(1)), start);
+            assert_eq!(view(next), start, "thresholds are strict");
+            assert_ne!(view(next + ms(1)), start);
+        }
     }
 
     #[test]

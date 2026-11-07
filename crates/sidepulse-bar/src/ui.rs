@@ -4,13 +4,13 @@
 use std::cell::RefCell;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
+use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
-use objc2_foundation::{NSString, NSURL};
+use objc2_foundation::{NSObjectProtocol, NSString, NSURL};
 
 use crate::session::state_for_mode;
 use crate::settings::{ClosedLidPolicy, LedDisplay};
@@ -24,6 +24,8 @@ pub enum Action {
     RemoveDevice(String),
     SetLidPolicy(ClosedLidPolicy),
     Quit,
+    /// The menu is about to open (`menuNeedsUpdate:`): refresh time-dependent rows.
+    MenuOpening,
 }
 
 impl Action {
@@ -35,6 +37,7 @@ impl Action {
             Action::RemoveDevice(p) => format!("remove\t{p}"),
             Action::SetLidPolicy(l) => format!("lid\t{}", l.as_str()),
             Action::Quit => "quit".into(),
+            Action::MenuOpening => "menu-opening".into(),
         }
     }
 
@@ -48,6 +51,7 @@ impl Action {
             ["remove", p] => Action::RemoveDevice((*p).into()),
             ["lid", l] => Action::SetLidPolicy(ClosedLidPolicy::parse(l)?),
             ["quit"] => Action::Quit,
+            ["menu-opening"] => Action::MenuOpening,
             _ => return None,
         })
     }
@@ -96,15 +100,29 @@ define_class!(
             let Some(obj) = sender.representedObject() else { return };
             let Ok(text) = obj.downcast::<NSString>() else { return };
             if let Some(action) = Action::decode(&text.to_string()) {
-                HANDLER.with(|h| {
-                    if let Some(handler) = h.borrow().as_ref() {
-                        handler(action);
-                    }
-                });
+                dispatch(action);
             }
         }
     }
+
+    unsafe impl NSObjectProtocol for MenuTarget {}
+
+    unsafe impl NSMenuDelegate for MenuTarget {
+        /// Called just before the menu is shown; items may be replaced here.
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, _menu: &NSMenu) {
+            dispatch(Action::MenuOpening);
+        }
+    }
 );
+
+fn dispatch(action: Action) {
+    HANDLER.with(|h| {
+        if let Some(handler) = h.borrow().as_ref() {
+            handler(action);
+        }
+    });
+}
 
 impl MenuTarget {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -117,6 +135,8 @@ pub struct StatusUi {
     mtm: MainThreadMarker,
     item: Retained<NSStatusItem>,
     target: Retained<MenuTarget>,
+    /// One menu for the app's lifetime, refilled in place so it can be updated while opening.
+    menu: Retained<NSMenu>,
     last_mode: Option<AgentMode>,
     last_model: Option<MenuModel>,
 }
@@ -134,10 +154,17 @@ impl StatusUi {
     pub fn new(mtm: MainThreadMarker, handler: Box<dyn Fn(Action)>) -> Self {
         HANDLER.with(|h| *h.borrow_mut() = Some(handler));
         let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+        let target = MenuTarget::new(mtm);
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
+        // The delegate is weak; `target` is kept alive by `StatusUi`.
+        menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
+        item.setMenu(Some(&menu));
         Self {
             mtm,
             item,
-            target: MenuTarget::new(mtm),
+            target,
+            menu,
             last_mode: None,
             last_model: None,
         }
@@ -185,13 +212,13 @@ impl StatusUi {
         item
     }
 
-    /// `build_menu`: rebuilt only when the model changed.
+    /// `build_menu`: refilled only when the model changed.
     pub fn set_menu(&mut self, model: &MenuModel) {
         if self.last_model.as_ref() == Some(model) {
             return;
         }
-        let menu = NSMenu::new(self.mtm);
-        menu.setAutoenablesItems(false);
+        let menu = &self.menu;
+        menu.removeAllItems();
         let add = |i: &NSMenuItem| menu.addItem(i);
         add(&self.item("SidePulse", None));
         add(&NSMenuItem::separatorItem(self.mtm));
@@ -275,7 +302,6 @@ impl StatusUi {
         let quit = self.item("Quit SidePulse", Some(&Action::Quit));
         quit.setKeyEquivalent(&NSString::from_str("q"));
         add(&quit);
-        self.item.setMenu(Some(&menu));
         self.last_model = Some(model.clone());
     }
 }
@@ -303,6 +329,7 @@ mod tests {
             Action::RemoveDevice("/Volumes/X".into()),
             Action::SetLidPolicy(ClosedLidPolicy::Agents),
             Action::Quit,
+            Action::MenuOpening,
         ] {
             assert_eq!(Action::decode(&a.encode()), Some(a));
         }

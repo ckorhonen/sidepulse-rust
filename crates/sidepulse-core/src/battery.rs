@@ -187,6 +187,29 @@ pub const BATTERY_KEYS: [&str; 19] = [
     "Temperature",
 ];
 
+/// Power-source change notifications (`IOPSNotificationCreateRunLoopSource`): plug, unplug,
+/// charge level and time-remaining changes, delivered on the main run loop. Replaces re-reading
+/// the battery on a fixed refresh timer. Removed on drop.
+pub struct PowerSourceWatch {
+    #[cfg(target_os = "macos")]
+    _inner: crate::power::iokit::PowerSourceWatch,
+}
+
+impl PowerSourceWatch {
+    /// Calls `on_change` on the main thread after each power-source change. `None` when
+    /// notifications are unavailable. Must be called on the main thread.
+    #[cfg(target_os = "macos")]
+    pub fn new(on_change: impl FnMut() + 'static) -> Option<Self> {
+        let inner = crate::power::iokit::PowerSourceWatch::new(Box::new(on_change))?;
+        Some(Self { _inner: inner })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn new(_on_change: impl FnMut() + 'static) -> Option<Self> {
+        None
+    }
+}
+
 /// `read_battery_snapshot()` with the model's default full-charge watts.
 pub fn read() -> Option<BatterySnapshot> {
     read_with(None)
@@ -559,7 +582,8 @@ impl BatteryLedController {
         self.sync_with(snapshot, brightness, now, write_program_to)
     }
 
-    fn sync_with(
+    /// [`BatteryLedController::sync`] with an injected writer (tests, dry runs).
+    pub fn sync_with(
         &mut self,
         snapshot: &BatterySnapshot,
         brightness: u8,

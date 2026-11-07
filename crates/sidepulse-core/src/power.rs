@@ -275,6 +275,12 @@ impl<H: Hold> KeepAwake<H> {
         }
     }
 
+    /// When the post-activity grace period ends, if it is still running at `now`. The hold is
+    /// released only by the next [`KeepAwake::update`] after that, so callers schedule one there.
+    pub fn grace_deadline(&self, now: Instant) -> Option<Instant> {
+        self.grace_until.filter(|until| *until > now)
+    }
+
     /// `release()`.
     pub fn release(&mut self) {
         self.hold.release();
@@ -422,6 +428,20 @@ impl KeepaliveToucher {
             return Some(path);
         }
         run_touch(self.toucher, &path, &self.last_error).then_some(path)
+    }
+
+    /// When the next [`KeepaliveToucher::poke`] of any of `targets` will touch: `now` for a target
+    /// never touched, else its last touch plus [`KeepaliveToucher::interval`]. `None` without
+    /// targets. Lets a caller sleep exactly until a touch is due instead of polling.
+    pub fn next_due(&self, targets: &[PathBuf], now: Instant) -> Option<Instant> {
+        targets
+            .iter()
+            .map(|target| {
+                self.last_by_path
+                    .get(&keepalive_file_for_target(target))
+                    .map_or(now, |last| *last + self.interval)
+            })
+            .min()
     }
 
     /// `last_status_error`.
@@ -594,6 +614,42 @@ mod tests {
             Some(status)
         );
         assert_eq!(TOUCHES.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn next_due_is_exactly_when_poke_touches_again() {
+        fn ok(_: &Path) -> io::Result<()> {
+            Ok(())
+        }
+        let t0 = Instant::now();
+        let a = PathBuf::from("/tmp/fake/A/LEDS.LED");
+        let b = PathBuf::from("/tmp/fake/B/LEDS.LED");
+        let mut toucher = KeepaliveToucher::new(ok, false);
+        assert_eq!(toucher.next_due(&[], t0), None);
+        assert_eq!(toucher.next_due(std::slice::from_ref(&a), t0), Some(t0));
+        toucher.poke(&a, t0);
+        toucher.poke(&b, at(t0, 10));
+        let targets = [a.clone(), b.clone()];
+        let due = toucher.next_due(&targets, at(t0, 20)).unwrap();
+        assert_eq!(due, at(t0, 60));
+        assert!(toucher.poke(&a, due - Duration::from_millis(1)).is_none());
+        assert!(toucher.poke(&a, due).is_some());
+        assert_eq!(toucher.next_due(&targets, due), Some(at(t0, 70)));
+        // A new device is due immediately.
+        let c = PathBuf::from("/tmp/fake/C/LEDS.LED");
+        assert_eq!(toucher.next_due(&[a, b, c], due), Some(due));
+    }
+
+    #[test]
+    fn grace_deadline_tracks_the_grace_period() {
+        let t0 = Instant::now();
+        let mut ka = KeepAwake::new(FakeHold::default());
+        ka.update(AgentMode::Working, at(t0, 0));
+        assert_eq!(ka.grace_deadline(at(t0, 0)), None);
+        ka.update(AgentMode::Completed, at(t0, 10));
+        assert_eq!(ka.grace_deadline(at(t0, 10)), Some(at(t0, 310)));
+        assert_eq!(ka.grace_deadline(at(t0, 310)), None);
+        assert!(!ka.update(AgentMode::Completed, at(t0, 310)));
     }
 
     #[test]
